@@ -1,15 +1,10 @@
-# Local dev infra stack: PostgreSQL, Redis, MinIO (S3-compatible object storage, ADR-0010) - the
-# three data/cache/storage containers container-diagram.md names, on one Docker network, one
-# command. This is deliberately infra-only for now.
+# Local dev infra stack: PostgreSQL, Redis, MinIO (S3-compatible object storage, ADR-0010), plus
+# ums-core (UMS.Host) and UMS.Workers now that release/DEVELOPMENT_PLAN.md Flow #2 has scaffolded
+# a buildable solution - the container-diagram.md containers, on one Docker network, one command.
 #
-# Excluded on purpose: ums-core, UMS.Workers, and all six ums-*-web frontend containers. None of
-# those repos have any code yet (release/DEVELOPMENT_PLAN.md - Flow #1 has no dependents built
-# yet) - the same reasoning kart-devops's own docker-compose.yml documented for its
-# not-yet-scaffolded stub services ("Excluded on purpose ... no code yet - add them here once
-# they're actually scaffolded"). Add an ums-core service (and its EF Core migration step - it owns
-# creating the schema-per-module layout, ADR-0004, this compose file does NOT pre-create schemas),
-# a UMS.Workers service, and one service block per frontend once each repo reaches a buildable
-# state (release/DEVELOPMENT_PLAN.md Flow #2 onward).
+# Still excluded: all six ums-*-web frontend containers and ums-core's own EF Core migration step
+# (no module has a DbContext yet - Identity, Flow #4, is the first). Add a migration step here once
+# that exists, and one service block per frontend once each reaches a buildable state.
 #
 # One Postgres instance, one database, no per-schema bootstrap SQL here - ADR-0004 puts the
 # schema-per-module layout entirely in ums-core's own EF Core migrations, not in infra tooling.
@@ -94,6 +89,57 @@ services:
       echo 'Bucket ready: '\"$$MINIO_BUCKET\"
       "
     restart: "no"
+
+  # UMS.Host - the single ums-core deployable (ADR-0001), all 18 modules behind one ASP.NET Core
+  # pipeline. No module exists yet (Identity is release/DEVELOPMENT_PLAN.md Flow #4), so this
+  # currently serves only /health/live and /health/ready plus the empty OpenAPI document.
+  ums-core:
+    build:
+      context: ../ums-core
+      dockerfile: Dockerfile
+    container_name: ums-core
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}"
+      ConnectionStrings__Redis: "redis:6379"
+    ports:
+      - "${UMS_CORE_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # UMS.Workers - background job runner (ADR-0014), a separate deployable from ums-core even
+  # though both build from this same repo. No async job exists yet, so this only proves the
+  # health-endpoint host runs; the first real worker (a module's outbox relay) lands with that
+  # module.
+  ums-workers:
+    build:
+      context: ../ums-core
+      dockerfile: Dockerfile.workers
+    container_name: ums-workers
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}"
+      ConnectionStrings__Redis: "redis:6379"
+    ports:
+      - "${UMS_WORKERS_PORT}:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
 volumes:
   postgres-data:

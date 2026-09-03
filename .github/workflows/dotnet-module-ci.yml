@@ -38,6 +38,11 @@ on:
         required: false
         type: string
         default: ""
+      dockerfile-path:
+        description: "Path to the Dockerfile to build, relative to the repo root. Defaults to the repo-root Dockerfile; ums-core's second deployable (UMS.Workers) calls this workflow a second time with Dockerfile.workers here."
+        required: false
+        type: string
+        default: "Dockerfile"
 
 jobs:
   build-test-scan:
@@ -95,7 +100,7 @@ jobs:
 
       - name: Docker build (smoke check)
         if: ${{ inputs.run-docker-build }}
-        run: docker build -t "ci-scan:${{ github.sha }}" .
+        run: docker build -f "${{ inputs.dockerfile-path }}" -t "ci-scan:${{ github.sha }}" .
 
       # §11.1: "container image scanning (Trivy or equivalent) on every build; a critical/high
       # finding blocks merge." Runs against the just-built smoke image, not a registry pull, so
