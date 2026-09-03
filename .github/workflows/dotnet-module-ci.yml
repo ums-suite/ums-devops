@@ -1,0 +1,112 @@
+name: .NET Module CI (Reusable)
+
+# Reusable CI workflow for ums-core (the single .NET 10 modular-monolith deployable) and
+# UMS.Workers (ums-conventions.md "CI: every repo calls the reusable workflow published from
+# ums-devops"). Implements the .NET-applicable rows of ums-requirements.md's quality posture:
+#   Code Quality/Linting (ums-conventions.md)  -> dotnet format, NetAnalyzers, StyleCop.Analyzers
+#   Dependency vulnerability scanning (§11.1)  -> `dotnet list package --vulnerable --include-transitive`
+#   Container image scanning (§11.1)           -> Trivy, gated by run-docker-build
+# `<Nullable>enable</Nullable>` + `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` live in the
+# CALLING repo's own Directory.Build.props (ums-conventions.md Code Quality section) - not
+# duplicated here, so `dotnet build` below already fails on any analyzer/nullable warning without
+# this workflow needing its own opinion on it. NetAnalyzers/StyleCop.Analyzers run as part of that
+# same `dotnet build` (they're NuGet analyzer packages referenced by the calling repo's projects,
+# not a separate CLI step) - see this repo's README for the exact package references expected.
+#
+# A critical/high finding in either scan gate blocks merge (§11.1's fail-the-build posture,
+# mirroring the lint/format gates) - neither step is advisory.
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        description: ".NET SDK version to install."
+        required: false
+        type: string
+        default: "10.0.x"
+      solution-path:
+        description: "Path to the repo's .sln file, relative to the repo root."
+        required: true
+        type: string
+      run-docker-build:
+        description: "Also build the repo's Dockerfile and Trivy-scan the resulting image (default true)."
+        required: false
+        type: boolean
+        default: true
+      image-name:
+        description: "Image name (without registry/owner prefix) used to tag the smoke-built image for the Trivy scan, e.g. ums-core. Required when run-docker-build is true."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-test-scan:
+    name: Build, Test, Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restore
+        run: dotnet restore "${{ inputs.solution-path }}"
+
+      - name: Coding standards (dotnet format)
+        run: dotnet format "${{ inputs.solution-path }}" --verify-no-changes
+
+      # NetAnalyzers + StyleCop.Analyzers run here too - they're analyzer packages referenced by
+      # the calling repo's own .csproj files, and Directory.Build.props' TreatWarningsAsErrors
+      # turns any violation into a build failure with no extra step needed.
+      - name: Build (Release)
+        run: dotnet build "${{ inputs.solution-path }}" --no-restore --configuration Release
+
+      # ums-requirements.md §11.1: "every repo's CI runs dependency vulnerability scanning
+      # (Dependabot/`dotnet list package --vulnerable` for .NET ...) ... a critical/high finding
+      # blocks merge." dotnet list package --vulnerable doesn't expose a severity-only exit code,
+      # so any reported vulnerable package (transitive included) fails the gate outright - the
+      # strictest reading of "blocks merge", and simpler than parsing severity out of text output.
+      - name: Security scan (vulnerable NuGet packages, §11.1)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet list "${{ inputs.solution-path }}" package --vulnerable --include-transitive | tee vulnerability-scan.txt
+          if grep -q "has the following vulnerable packages" vulnerability-scan.txt; then
+            echo "::error::Vulnerable NuGet package(s) found - see the scan output above. §11.1 blocks merge on any critical/high finding."
+            exit 1
+          fi
+
+      # GitHub-hosted ubuntu-latest runners ship Docker preinstalled, so Testcontainers-backed
+      # integration tests (e.g. a real PostgreSQL/Redis instance) run here with no extra setup.
+      - name: Test (unit, integration)
+        run: >
+          dotnet test "${{ inputs.solution-path }}" --no-build --configuration Release
+          --logger "trx;LogFileName=test-results.trx" --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults
+
+      - name: Docker build (smoke check)
+        if: ${{ inputs.run-docker-build }}
+        run: docker build -t "ci-scan:${{ github.sha }}" .
+
+      # §11.1: "container image scanning (Trivy or equivalent) on every build; a critical/high
+      # finding blocks merge." Runs against the just-built smoke image, not a registry pull, so
+      # this catches an OS/base-image or app-dependency CVE before the image is ever pushed
+      # (docker-build-push.yml's own Trivy step is the equivalent gate for the real publish path).
+      - name: Container vulnerability scan (Trivy, §11.1)
+        if: ${{ inputs.run-docker-build }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "ci-scan:${{ github.sha }}"
+          format: table
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true

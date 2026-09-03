@@ -1,0 +1,113 @@
+name: Angular App CI (Reusable)
+
+# Reusable CI workflow for any Angular 22 repo in the platform: the six ums-*-web apps plus
+# ums-design-system (ums-conventions.md "CI: every repo calls the reusable workflow published
+# from ums-devops"). Mirrors dotnet-module-ci.yml's shape for the Node/Angular ecosystem:
+#   Code Quality/Linting (ums-conventions.md)  -> ESLint (@angular-eslint + typescript-eslint
+#                                                  strict), Prettier, Stylelint
+#   Dependency vulnerability scanning (§11.1)  -> `npm audit --audit-level=high`
+#   Container image scanning (§11.1)           -> Trivy, gated by run-docker-build
+#
+# Prerequisites this workflow assumes every calling repo's package.json already defines
+# (ums-conventions.md Code Quality section):
+#   "lint"           -> eslint . --max-warnings 0
+#   "format:check"   -> prettier --check .
+#   "stylelint"      -> stylelint "**/*.scss"
+#   "test"           -> ng test (headless Chrome flags passed by this workflow, below)
+#   "build"          -> ng build (production)
+# A critical/high finding in either scan gate blocks merge (§11.1), same posture as the .NET
+# workflow - neither step is advisory.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to install."
+        required: false
+        type: string
+        default: "22.x"
+      working-directory:
+        description: "Directory containing the app's package.json, relative to the repo root."
+        required: false
+        type: string
+        default: "."
+      run-docker-build:
+        description: "Also build the repo's Dockerfile and Trivy-scan the resulting image (default true)."
+        required: false
+        type: boolean
+        default: true
+      image-name:
+        description: "Image name (without registry/owner prefix) used to tag the smoke-built image for the Trivy scan, e.g. ums-student-web. Required when run-docker-build is true."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  lint-test-scan-build:
+    name: Lint, Test, Scan, Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # ums-requirements.md §11.1: "every repo's CI runs dependency vulnerability scanning
+      # (... `npm audit`/Dependabot for Angular) ... a critical/high finding blocks merge."
+      # --audit-level=high fails the step on any high-or-critical advisory; moderate/low findings
+      # are reported by Dependabot separately and don't block a build on their own.
+      - name: Security scan (npm audit, §11.1)
+        run: npm audit --audit-level=high
+
+      - name: Coding standards (ESLint, --max-warnings 0)
+        run: npm run lint
+
+      - name: Coding standards (Prettier --check)
+        run: npm run format:check
+
+      - name: Coding standards (Stylelint)
+        run: npm run stylelint
+
+      # ubuntu-latest GitHub-hosted runners ship a system Chrome, so Angular's default
+      # Karma+Jasmine ChromeHeadless launcher works with no extra browser installation step.
+      - name: Test (unit/component, headless Chrome)
+        run: npm run test -- --watch=false --browsers=ChromeHeadless
+
+      - name: Build (production)
+        run: npm run build
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: ${{ inputs.working-directory }}/dist
+          if-no-files-found: ignore
+
+      - name: Docker build (smoke check)
+        if: ${{ inputs.run-docker-build }}
+        run: docker build -t "ci-scan:${{ github.sha }}" .
+
+      # §11.1: "container image scanning (Trivy or equivalent) on every build; a critical/high
+      # finding blocks merge." Same gate as dotnet-module-ci.yml, applied to the Angular app's own
+      # (nginx-serving, or SSR Node) runtime image.
+      - name: Container vulnerability scan (Trivy, §11.1)
+        if: ${{ inputs.run-docker-build }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "ci-scan:${{ github.sha }}"
+          format: table
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true

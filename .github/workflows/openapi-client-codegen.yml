@@ -1,0 +1,99 @@
+name: OpenAPI Client Codegen Check (Reusable)
+
+# Reusable workflow, called from ums-shared's own CI: regenerates ums-shared's TypeScript client
+# from ums-core's single OpenAPI contract via `openapi-generator-cli` (Docker image, chosen over
+# the npm wrapper package because the npm package just downloads and shells out to the same Java
+# JAR at install time - the Docker image is a pinned, ready-to-run artifact with no extra JDK/Java
+# setup step, more reliable in CI), then fails the build if regeneration produced an uncommitted
+# diff - i.e. it's also the "generated client is up to date" check, not just a generator.
+#
+# UMS has exactly ONE source contract (ums-core's single OpenAPI document covering all 18
+# in-process modules under /api/v1/<module>/..., ADR-0001/ums-conventions.md API Versioning) -
+# unlike kart-commerce's per-microservice codegen, this workflow checks out ums-core as a second
+# repo (source-repo/source-ref) rather than reading a contract already sitting in the calling
+# repo's own checkout.
+
+on:
+  workflow_call:
+    inputs:
+      source-repo:
+        description: "owner/repo that owns the OpenAPI contract (ums-core)."
+        required: false
+        type: string
+        default: "ums-suite/ums-core"
+      source-ref:
+        description: "Git ref of source-repo to check out the contract from."
+        required: false
+        type: string
+        default: "main"
+      contract-path:
+        description: "Path to the OpenAPI contract file, relative to source-repo's root (e.g. openapi/ums-core.yaml)."
+        required: true
+        type: string
+      output-dir:
+        description: "Directory the generated Angular HttpClient client is emitted into, relative to the calling (ums-shared) repo root."
+        required: true
+        type: string
+      npm-name:
+        description: "npmName generator property for the generated client package (e.g. @ums/shared-client)."
+        required: false
+        type: string
+        default: ""
+      generator-image-tag:
+        description: "Pinned tag of the openapitools/openapi-generator-cli Docker image."
+        required: false
+        type: string
+        default: "v7.9.0"
+      fail-on-diff:
+        description: "Fail the build if regenerating the client produces an uncommitted diff (default true). Set false for a pure 'regenerate' run with no drift check."
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      source-checkout-token:
+        description: "Token with read access to source-repo, for cross-repo checkout if it's private. Falls back to the default GITHUB_TOKEN otherwise (works only if source-repo is public or the same repo)."
+        required: false
+
+jobs:
+  codegen-check:
+    name: Regenerate & verify client is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ums-shared (this repo)
+        uses: actions/checkout@v4
+
+      - name: Checkout ums-core (contract source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source-repo }}
+          ref: ${{ inputs.source-ref }}
+          token: ${{ secrets.source-checkout-token || secrets.GITHUB_TOKEN }}
+          path: .ums-core-src
+
+      - name: Generate Angular HttpClient client from ums-core's OpenAPI contract
+        run: |
+          mkdir -p "${{ inputs.output-dir }}"
+          docker run --rm \
+            -v "${{ github.workspace }}:/local" \
+            "openapitools/openapi-generator-cli:${{ inputs.generator-image-tag }}" generate \
+            -i "/local/.ums-core-src/${{ inputs.contract-path }}" \
+            -g typescript-angular \
+            -o "/local/${{ inputs.output-dir }}" \
+            ${{ inputs.npm-name != '' && format('--additional-properties=npmName={0}', inputs.npm-name) || '' }}
+
+      - name: Check generated client is up to date
+        if: ${{ inputs.fail-on-diff }}
+        run: |
+          if ! git diff --quiet -- "${{ inputs.output-dir }}" || [ -n "$(git status --porcelain -- "${{ inputs.output-dir }}")" ]; then
+            echo "::error::Regenerating the client from ums-core's ${{ inputs.contract-path }} produced changes that aren't committed in ${{ inputs.output-dir }}. Run this generation step locally and commit the result."
+            git status --porcelain -- "${{ inputs.output-dir }}"
+            git diff -- "${{ inputs.output-dir }}"
+            exit 1
+          fi
+
+      - name: Upload generated client (for inspection on failure or PR preview)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-client
+          path: ${{ inputs.output-dir }}

@@ -1,0 +1,17 @@
+# Minimal Prometheus scrape config for local development (ums-conventions.md Observability).
+# Scrapes itself plus the OTel Collector's Prometheus-format exporter, which is what carries
+# ums-core/UMS.Workers's OTLP-exported metrics in this local stack. Real per-module metric labels
+# arrive already attached via OpenTelemetry - no additional scrape target is needed once ums-core
+# exists, since every module shares the one process's /metrics-equivalent OTLP export.
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]

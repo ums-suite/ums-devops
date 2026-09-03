@@ -1,0 +1,109 @@
+name: Docker Build, Scan & Push (Reusable)
+
+# Reusable workflow that builds a calling repo's Dockerfile, Trivy-scans the resulting image, and
+# only then pushes it to GitHub Container Registry (ghcr.io) - no extra registry account needed
+# beyond the repo's own GITHUB_TOKEN. This is the concrete implementation of ums-requirements.md
+# §11.1's "container image scanning (Trivy or equivalent) on every build; a critical/high finding
+# blocks merge" - the scan runs on every build (PR and default-branch alike), and the push step is
+# only reachable once it has passed. On pull-request branches this workflow builds and scans (a
+# real gate, not just a smoke check) but never pushes; only a push to the repo's default branch
+# publishes `:latest` and the immutable `:<git-sha>` tag, matching dotnet-module-ci.yml/
+# angular-app-ci.yml's own smoke-build-only posture on PRs.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Image name, without registry/owner prefix (e.g. ums-core, ums-student-web)."
+        required: true
+        type: string
+      dockerfile-path:
+        description: "Path to the Dockerfile, relative to the repo root."
+        required: false
+        type: string
+        default: "Dockerfile"
+      context:
+        description: "Docker build context, relative to the repo root."
+        required: false
+        type: string
+        default: "."
+    outputs:
+      image-ref:
+        description: "Fully-qualified image reference that was built (SHA-tagged)."
+        value: ${{ jobs.build-scan-push.outputs.image-ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-scan-push:
+    name: Build, Scan & Push
+    runs-on: ubuntu-latest
+    outputs:
+      image-ref: ${{ steps.vars.outputs.image-ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image vars
+        id: vars
+        run: |
+          registry_image="ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
+          echo "registry-image=${registry_image}" >> "$GITHUB_OUTPUT"
+          echo "image-ref=${registry_image}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "is-default-branch=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build and load into the local Docker daemon only - never pushed yet. The Trivy gate below
+      # runs against this local image; the second, push-enabled build further down reuses the same
+      # layers via the GHA cache (cache-from/to type=gha) so re-building costs almost nothing.
+      - name: Build (local, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile-path }}
+          push: false
+          load: true
+          tags: ${{ steps.vars.outputs.image-ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # §11.1: "a critical/high finding blocks merge" - this step's exit-code:1 fails the whole
+      # workflow before the login/push steps below ever run, so a vulnerable image is never
+      # published to ghcr.io regardless of branch.
+      - name: Container vulnerability scan (Trivy, §11.1)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image-ref }}
+          format: table
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Log in to GitHub Container Registry
+        if: steps.vars.outputs.is-default-branch == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only reached once the Trivy gate above has passed. PR branches stop here (build + scan
+      # only, matching dotnet-module-ci.yml/angular-app-ci.yml's smoke-build posture); the default
+      # branch additionally pushes `:latest` and the immutable `:<git-sha>` tag so a deploy can pin
+      # to an exact, reproducible image rather than a floating tag.
+      - name: Push (default branch only)
+        if: steps.vars.outputs.is-default-branch == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile-path }}
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.registry-image }}:latest
+            ${{ steps.vars.outputs.registry-image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

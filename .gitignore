@@ -3,3 +3,10 @@ Thumbs.db
 *.tmp
 .idea/
 .vscode/
+
+# Local-dev secrets (throwaway Postgres/MinIO creds) - see .env.example for the shape.
+# scripts/dev-up.sh auto-copies .env.example -> .env on first run.
+.env
+.env.*
+!.env.example
+

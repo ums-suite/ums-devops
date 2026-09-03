@@ -1,0 +1,105 @@
+# Shared local-dev observability stack: Grafana + Loki + Tempo + Prometheus + an OpenTelemetry
+# Collector (ums-conventions.md Observability: Serilog -> OTLP -> this Collector -> Loki;
+# OpenTelemetry SDK -> OTLP -> this Collector -> Tempo; OpenTelemetry Metrics -> this Collector ->
+# Prometheus exporter). Owned once, centrally, here - ums-core/UMS.Workers/every ums-*-web repo's
+# own README should point developers at this file rather than copy-pasting one. This is the
+# local-dev equivalent only - ums-infra's helm/platform-observability owns the real Helm-deployed
+# LGTM stack for the kind cluster (release/DEVELOPMENT_PLAN.md Flow #1).
+#
+# Usage:
+#   docker compose -f docker-compose.observability.yml up -d
+# Then point ums-core/UMS.Workers's OTLP exporter at the collector (grpc: localhost:4317, http:
+# localhost:4318) and open Grafana at http://localhost:3000 (default login admin/admin).
+#
+# `name:` below is load-bearing: without it, Compose infers a project name from the current
+# directory, which collides with docker-compose.yml's own inferred name when both are run from
+# this same repo root - `docker compose down` tears down its entire inferred project, not just
+# the services in the file you pointed it at, so an unnamed `down` on one file can silently take
+# the other stack down too (this bit kart-devops the hard way - see its own file for the story).
+# This explicit name keeps the two stacks permanently distinct.
+name: ums-observability
+
+services:
+  grafana:
+    image: grafana/grafana:13.1.1
+    container_name: ums-observability-grafana
+    ports:
+      - "${GRAFANA_PORT}:3000" # Grafana UI - http://localhost:3000, default login admin/admin
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Grafana's own SQLite DB (dashboards, users, orgs, everything not provisioned from the
+      # read-only mount above) lives at /var/lib/grafana/grafana.db - without a volume it's just a
+      # container filesystem layer, gone on the next recreate (any config/image change, not just
+      # an explicit `down`). This volume alone survives restarts/recreates; only `down -v` or
+      # `docker volume rm` clears it.
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+      - tempo
+      - prometheus
+
+  loki:
+    image: grafana/loki:3.6.13
+    container_name: ums-observability-loki
+    ports:
+      - "${LOKI_PORT}:3100" # Loki push/query API (also accepts native OTLP logs at /otlp/v1/logs)
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      # local-config.yaml's default storage path is /loki (chunks/index/wal) - unmounted, log
+      # history wouldn't survive a container recreate.
+      - loki-data:/loki
+
+  tempo:
+    image: grafana/tempo:2.9.4
+    container_name: ums-observability-tempo
+    ports:
+      - "${TEMPO_PORT}:3200" # Tempo query API, used by Grafana's Tempo datasource
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      # tempo.yaml's storage.trace.local.path/wal.path - unmounted, trace history wouldn't survive
+      # a container recreate either. Same fix as loki-data above.
+      - tempo-data:/var/tempo
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    container_name: ums-observability-prometheus
+    ports:
+      - "${PROMETHEUS_PORT}:9090" # Prometheus UI/API - http://localhost:9090
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Prometheus's TSDB default path - unmounted, metric history wouldn't survive a container
+      # recreate either. Same fix as loki-data/tempo-data above.
+      - prometheus-data:/prometheus
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.157.0
+    container_name: ums-observability-otel-collector
+    ports:
+      - "${OTEL_GRPC_PORT}:4317"    # OTLP gRPC - point OTEL_EXPORTER_OTLP_ENDPOINT here (grpc)
+      - "${OTEL_HTTP_PORT}:4318"    # OTLP HTTP - point OTEL_EXPORTER_OTLP_ENDPOINT here (http/protobuf)
+      - "${OTEL_METRICS_PORT}:8889" # Prometheus-format metrics endpoint, scraped by the prometheus service above
+      - "${OTEL_HEALTH_PORT}:13133" # health_check extension - GET / -> 200 once ready
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - loki
+      - tempo
+      - prometheus
+
+volumes:
+  grafana-data:
+  loki-data:
+  tempo-data:
+  prometheus-data:
+
+# docker-compose.yml's postgres/redis/minio containers don't need to reach this stack directly (no
+# app container exists yet to emit OTLP - see docker-compose.yml's own header comment on what's
+# excluded so far). Kept as an unnamed default (per-project) network for now, unlike kart-devops's
+# external shared network, since there's no cross-stack container-to-container traffic to wire up
+# yet. Revisit this the same way kart-devops did (a named external network both compose files
+# share) once ums-core/UMS.Workers containers exist and need to reach otel-collector by DNS name.

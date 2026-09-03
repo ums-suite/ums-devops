@@ -1,0 +1,18 @@
+# Dashboard provisioning provider (Grafana's file-based provisioning, separate from the
+# datasources.yaml one directory up). Loads every *.json file in ./json on each Grafana startup
+# and keeps them in sync. See ./json/README.md - there are no real dashboards yet, since no
+# service emits metrics until ums-core exists (release/DEVELOPMENT_PLAN.md Flow #2 onward).
+
+apiVersion: 1
+
+providers:
+  - name: ums-dashboards
+    orgId: 1
+    folder: "" # top-level, not nested under a named folder
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true # UI edits are allowed day-to-day; export back to json/ to make them stick
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: true

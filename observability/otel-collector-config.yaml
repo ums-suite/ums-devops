@@ -1,0 +1,50 @@
+# Minimal OpenTelemetry Collector config for local development (ums-conventions.md Observability:
+# Serilog -> OTLP -> this Collector -> Loki; OpenTelemetry SDK -> OTLP -> this Collector -> Tempo;
+# OpenTelemetry Metrics -> this Collector -> Prometheus exporter, scraped by the prometheus
+# service). ums-core/UMS.Workers point their OTEL_EXPORTER_OTLP_ENDPOINT at otel-collector:4317
+# (grpc) or :4318 (http) - never directly at Loki/Tempo - so the shipping mechanism stays an infra
+# concern, not application code.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+# Exposes GET :13133/ -> 200 once the Collector has finished starting - the only way to health-
+# check the Collector itself from outside (it has no other HTTP endpoint that isn't a signal
+# receiver).
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]
