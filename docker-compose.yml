@@ -1,10 +1,10 @@
 # Local dev infra stack: PostgreSQL, Redis, MinIO (S3-compatible object storage, ADR-0010), plus
-# ums-core (UMS.Host) and UMS.Workers now that release/DEVELOPMENT_PLAN.md Flow #2 has scaffolded
-# a buildable solution - the container-diagram.md containers, on one Docker network, one command.
+# ums-core (UMS.Host), UMS.Workers, and all six ums-*-web frontends now that every backend flow
+# and every frontend app is fully built - the container-diagram.md containers, on one Docker
+# network, one command.
 #
-# Still excluded: all six ums-*-web frontend containers and ums-core's own EF Core migration step
-# (no module has a DbContext yet - Identity, Flow #4, is the first). Add a migration step here once
-# that exists, and one service block per frontend once each reaches a buildable state.
+# Still excluded: ums-core's own EF Core migration step is applied by ums-core itself on startup
+# (see its own Program.cs), not as a separate compose service/init container.
 #
 # One Postgres instance, one database, no per-schema bootstrap SQL here - ADR-0004 puts the
 # schema-per-module layout entirely in ums-core's own EF Core migrations, not in infra tooling.
@@ -14,6 +14,33 @@
 # Usage: scripts/dev-up.sh (auto-copies .env.example -> .env on first run, then
 # `docker compose up -d`). Host ports come from ports.env (committed, not a secret) -
 # credentials come from .env (gitignored - see .env.example).
+#
+# --- Frontend API base URL (all six ums-*-web services below) ---
+# Every app's production `environment.ts` bakes `apiBaseUrl` in at Angular *build* time (Angular
+# inlines it into the compiled bundle - it is not a runtime-configurable value), and every app's
+# own HTTP layer (`core/http/provide-core-http.ts`) is written so ALL API calls originate
+# client-side, in the browser (`provideApi`/`UMS_AUTH_CONFIG` are both bootstrapped from that same
+# baked value). That means the correct base URL for local-dev-container purposes is the URL the
+# HOST machine's browser can reach ums-core at - i.e. `http://localhost:${UMS_CORE_PORT}` - NOT
+# the in-network `http://ums-core:8080` address (the browser is never inside the Compose network).
+# Each frontend's Dockerfile takes this as an `API_BASE_URL` build arg and `sed`s it into
+# `src/environments/environment.ts` before `ng build` - see each Dockerfile's own header comment.
+#
+# Known limitation: `ums-public-web` and `ums-alumni-web` render almost every route with
+# `RenderMode.Server` (see each app's own `app.routes.server.ts`), meaning their Express/Node
+# process ALSO issues its own server-side data-fetch calls using this same baked URL - and
+# `http://localhost:${UMS_CORE_PORT}` is not reachable as "localhost" from inside those
+# containers' own network namespace (only from the host). Those specific server-rendered,
+# data-backed routes will render a degraded/empty-state shell rather than fully hydrated content
+# when curled directly; all client-side/hydrated and CSR-only routes (e.g. `/app/**`, `/login`)
+# are unaffected since they run entirely in-browser against the host-published port. Fixing this
+# properly needs a per-platform (browser vs. server) base-URL split inside each app - out of scope
+# for this devops-only change; tracked here rather than silently glossed over.
+#
+# `ums-admission-web`'s `angular.json` also ships `security.allowedHosts: []` (a deny-ALL for
+# `@angular/ssr`'s SSRF-prevention host-header check - every request 500s otherwise, per that
+# app's own `src/server.ts` doc comment). `NG_ALLOWED_HOSTS=*` below is what that same comment
+# says `@angular/ssr` reads ahead of the baked-in list, so this is set for all three SSR services.
 
 name: ums-devops
 
@@ -98,15 +125,27 @@ services:
       context: ../ums-core
       dockerfile: Dockerfile
     container_name: ums-core
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}"
+      ConnectionStrings__Redis: "redis:6379"
+      # appsettings.Development.json hardcodes both of these to http://localhost:9000 (only
+      # right when ums-core runs on the host, not in a container) - env vars win over
+      # appsettings.json in ASP.NET Core's config precedence, so this is what actually points the
+      # Audit/Documents modules' S3ObjectStorage at the in-network minio service instead.
+      Audit__Storage__Endpoint: "http://minio:9000"
+      Audit__Storage__AccessKey: "${MINIO_ROOT_USER}"
+      Audit__Storage__SecretKey: "${MINIO_ROOT_PASSWORD}"
+      Documents__Storage__Endpoint: "http://minio:9000"
+      Documents__Storage__AccessKey: "${MINIO_ROOT_USER}"
+      Documents__Storage__SecretKey: "${MINIO_ROOT_PASSWORD}"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      ASPNETCORE_ENVIRONMENT: Development
-      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}"
-      ConnectionStrings__Redis: "redis:6379"
+      minio:
+        condition: service_healthy
     ports:
       - "${UMS_CORE_PORT}:8080"
     healthcheck:
@@ -129,14 +168,153 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}"
       ConnectionStrings__Redis: "redis:6379"
+      # Same S3ObjectStorage hardcoded-localhost fix as ums-core above - UMS.Workers loads the
+      # same appsettings.Development.json shape from its own project.
+      Audit__Storage__Endpoint: "http://minio:9000"
+      Audit__Storage__AccessKey: "${MINIO_ROOT_USER}"
+      Audit__Storage__SecretKey: "${MINIO_ROOT_PASSWORD}"
+      Documents__Storage__Endpoint: "http://minio:9000"
+      Documents__Storage__AccessKey: "${MINIO_ROOT_USER}"
+      Documents__Storage__SecretKey: "${MINIO_ROOT_PASSWORD}"
     ports:
       - "${UMS_WORKERS_PORT}:8081"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ums-public-web - anonymous/public-facing app (near-fully SSR, RenderMode.Server for almost
+  # every route - see its own app.routes.server.ts). See the "Frontend API base URL" comment near
+  # the top of this file for how API_BASE_URL/NG_ALLOWED_HOSTS are chosen.
+  ums-public-web:
+    build:
+      context: ../ums-public-web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: "http://localhost:${UMS_CORE_PORT}"
+    container_name: ums-public-web
+    depends_on:
+      ums-core:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      NG_ALLOWED_HOSTS: "*"
+    ports:
+      - "${PUBLIC_WEB_PORT}:4000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ums-admission-web - applicant-facing admission funnel. Prerendered marketing pages +
+  # CSR-only authenticated funnel under /app (see its own app.routes.server.ts). Its own
+  # angular.json ships security.allowedHosts: [] (a documented deny-ALL bug in that app's own
+  # src/server.ts comment) - NG_ALLOWED_HOSTS below is required here, not just a nicety.
+  ums-admission-web:
+    build:
+      context: ../ums-admission-web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: "http://localhost:${UMS_CORE_PORT}"
+    container_name: ums-admission-web
+    depends_on:
+      ums-core:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      NG_ALLOWED_HOSTS: "*"
+    ports:
+      - "${ADMISSION_WEB_PORT}:4000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ums-student-web - CSR-only Angular SPA, static files served by nginx (no Node runtime needed).
+  ums-student-web:
+    build:
+      context: ../ums-student-web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: "http://localhost:${UMS_CORE_PORT}"
+    container_name: ums-student-web
+    depends_on:
+      ums-core:
+        condition: service_healthy
+    ports:
+      - "${STUDENT_WEB_PORT}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ums-faculty-web - CSR-only Angular SPA, static files served by nginx.
+  ums-faculty-web:
+    build:
+      context: ../ums-faculty-web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: "http://localhost:${UMS_CORE_PORT}"
+    container_name: ums-faculty-web
+    depends_on:
+      ums-core:
+        condition: service_healthy
+    ports:
+      - "${FACULTY_WEB_PORT}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ums-admin-web - CSR-only Angular SPA, static files served by nginx.
+  ums-admin-web:
+    build:
+      context: ../ums-admin-web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: "http://localhost:${UMS_CORE_PORT}"
+    container_name: ums-admin-web
+    depends_on:
+      ums-core:
+        condition: service_healthy
+    ports:
+      - "${ADMIN_WEB_PORT}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ums-alumni-web - hybrid SSR/CSR (SSR for anonymous campaign/donation/story pages, CSR for the
+  # authenticated /app shell + /login/register - see its own app.routes.server.ts).
+  ums-alumni-web:
+    build:
+      context: ../ums-alumni-web
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: "http://localhost:${UMS_CORE_PORT}"
+    container_name: ums-alumni-web
+    depends_on:
+      ums-core:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      NG_ALLOWED_HOSTS: "*"
+    ports:
+      - "${ALUMNI_WEB_PORT}:4000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/"]
       interval: 5s
       timeout: 5s
       retries: 10
