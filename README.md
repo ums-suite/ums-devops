@@ -10,12 +10,9 @@ local dev-loop.
 
 ## Status
 
-Infra/observability stack and reusable workflows are real and usable **now**, ahead of any
-application repo existing — see the verification section below. Per-repo application wiring
-(Dockerfiles, actual CI callers, `ums-core`/`UMS.Workers`/frontend service blocks in
-`docker-compose.yml`) happens as each repo is scaffolded in later
-[`release/DEVELOPMENT_PLAN.md`](https://github.com/ums-suite/ums-suite/blob/main/release/DEVELOPMENT_PLAN.md)
-flows.
+All 30 backend flows and all six frontend apps are now built and merged, and `docker-compose.yml`
+brings up the full stack in one command: Postgres, Redis, MinIO (+ bucket bootstrap), `ums-core`,
+`UMS.Workers`, and all six `ums-*-web` frontends. See the verification section below.
 
 ## Repository layout
 
@@ -64,14 +61,18 @@ scripts/dev-down.sh            # stop everything (-v also wipes data volumes)
 
 ## What's here today (`docker-compose.yml`)
 
-Postgres, Redis, and MinIO (S3-compatible object storage, ADR-0010) — the three data/cache/storage
-containers `container-diagram.md` names — on one Docker network, one command.
+Postgres, Redis, and MinIO (S3-compatible object storage, ADR-0010), plus `ums-core`, `UMS.Workers`,
+and all six `ums-*-web` frontends — every container `container-diagram.md` names, on one Docker
+network, one command (`scripts/dev-up.sh`, or `docker compose --env-file ports.env --env-file .env
+up -d`).
 
-**Excluded on purpose:** `ums-core`, `UMS.Workers`, and all six `ums-*-web` frontends have no code
-yet (every repo but `ums-infra`/`ums-devops` is "Not Started" in `release/DEVELOPMENT_PLAN.md`) —
-add a service block for each here once that repo is actually scaffolded, mirroring how
-`kart-devops`'s own `docker-compose.yml` originally excluded its own not-yet-scaffolded stub
-services with the same reasoning ("no code yet — add them here once they're actually scaffolded").
+`ums-core`/`UMS.Workers` build from `../ums-core`'s own `Dockerfile`/`Dockerfile.workers`. Each
+frontend builds from its own repo's `Dockerfile` (added alongside this wiring): the three SSR apps
+(`ums-admission-web`, `ums-public-web`, `ums-alumni-web`) build a Node/Express runtime image; the
+three CSR-only apps (`ums-student-web`, `ums-admin-web`, `ums-faculty-web`) build an `nginx`-served
+static image. See the "Frontend API base URL" comment block near the top of `docker-compose.yml`
+for how each app's API base URL is wired, including a documented limitation for the two
+mostly-server-rendered apps' server-side data fetches.
 
 ## Ports
 
@@ -93,12 +94,6 @@ yourself if calling `docker compose` directly.
 | OTel Collector (gRPC / HTTP) | 4317 / 4318 |
 | OTel Collector (Prometheus exporter) | 8889 |
 | OTel Collector (health check) | 13133 |
-
-**Reserved, not yet wired to any container** (documented now so the choice is made once, not
-improvised per-repo later — see `ports.env`'s own comment):
-
-| Repo | Host port |
-|---|---|
 | `ums-core` (single API, no gateway) | 8080 |
 | `UMS.Workers` (health endpoints only) | 8081 |
 | `ums-public-web` | 4200 |
